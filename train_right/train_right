@@ -24,7 +24,7 @@ parser.add_argument('--mask_file', type=str, default='/home/elvin/SSPS/data/nr40
 parser.add_argument('--train_file', type=str, default='pretrain_sota.py')
 parser.add_argument('--device_num', type=int, default=7)
 parser.add_argument('--subset_name', type=str, default='20092001')
-parser.add_argument('--input_dim', type=int, default=10)
+parser.add_argument('--input_dim', type=int, default=150)
 parser.add_argument('--target_epochs', type=int, default=500)
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--learning_rate', type=int, default=0.002)
@@ -71,7 +71,7 @@ class DistanceWindow(Dataset):
         sequence = torch.tensor([dic[aa] for aa in list(seq)])
         arrays = np.load(os.path.join(self.distance_window_path, filename))
         arrays[:, :, 4] = arrays[:, :, 4] / 100
-        arrays = arrays[:, :1, :]
+        # arrays = arrays[:, :1, :]
         arrays = arrays.reshape(arrays.shape[0], arrays.shape[1]*arrays.shape[2])
         filename = filename.split('.')[0]
         # mix_arrays = np.concatenate((arrays[:-1], arrays[1:]), 1)
