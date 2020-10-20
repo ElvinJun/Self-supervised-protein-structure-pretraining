@@ -1,0 +1,232 @@
+import torch
+import torch.nn as nn
+import shutil
+from torch.utils.data import Dataset, DataLoader
+import pathlib
+import os
+import time
+import numpy as np
+from torch.nn import functional as F
+import math
+import argparse
+import logging
+from logging import handlers
+from scipy.stats import pearsonr
+from scipy.stats import spearmanr
+
+dic = {'A': 0, 'F': 1, 'C': 2, 'D': 3, 'N': 4, 'E': 5, 'Q': 6, 'G': 7, 'H': 8, 'L': 9, 'I': 10,
+       'K': 11, 'M': 12, 'P': 13, 'R': 14, 'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19}
+
+parser = argparse.ArgumentParser(description='manual to this script')
+parser.add_argument('--path_file', type=str, default='/home/joseph/data/nr40/knn_net/knn_net_150')
+parser.add_argument('--seq_file', type=str, default='/home/joseph/data/nr40/seq_luo')
+parser.add_argument('--mask_file', type=str, default='/home/joseph/data/nr40/mask/')
+parser.add_argument('--train_file', type=str, default='pretrain_sota.py')
+parser.add_argument('--device_num', type=int, default=4)
+parser.add_argument('--subset_name', type=str, default='20201019_3_sota_right_n1_knnnet100')
+parser.add_argument('--input_dim', type=int, default=100)
+parser.add_argument('--target_epochs', type=int, default=500)
+parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--learning_rate', type=int, default=0.002)
+args = parser.parse_args()
+
+device_num = args.device_num
+torch.cuda.set_device(device_num)
+device = torch.device('cuda:%d' % device_num)
+range_n = 2
+#loss
+loss_function = nn.CrossEntropyLoss()
+subset_name = args.subset_name
+total_iters = 0
+train_name = 'self_%s' % subset_name
+save_dir = '/home/joseph/KNN/outputs/' + train_name
+val_dir = os.path.join(save_dir, 'val')
+for folder in [save_dir, val_dir]:
+    pathlib.Path(folder).mkdir(parents=True, exist_ok=True)
+shutil.copy(os.path.join(os.getcwd(), args.train_file),  save_dir)
+
+class DistanceWindow(Dataset):
+    """Extract distance window arrays"""
+    def __init__(self, distance_window_path, k):
+        self.distance_window_path = distance_window_path
+        self.file_list = os.listdir(distance_window_path)
+        self.k = int(k)
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        filename = self.file_list[idx]
+        # seq = open(os.path.join(args.seq_file, filename.split('.')[0] + '.fasta')).readlines()[1]
+        seq_all = open(os.path.join(args.seq_file, filename.split('.')[0] + '.txt')).read()
+        mask = np.load(os.path.join(args.mask_file, filename.split('.')[0] + '.npy'))
+        for i in range(len(mask)):
+            if mask[i] != 0:
+                start = i
+                break
+        for i in range(len(mask) - 1, -1, -1):
+            if mask[i] != 0:
+                end = i
+                break
+        seq = seq_all[start: end+1]
+        sequence = torch.tensor([dic[aa] for aa in list(seq)])
+        arrays = np.load(os.path.join(self.distance_window_path, filename))
+        arrays[:, :, 4] = arrays[:, :, 4] / 100
+        arrays = arrays[:, :self.k, :]
+        arrays = arrays.reshape(arrays.shape[0], arrays.shape[1]*arrays.shape[2])
+        filename = filename.split('.')[0]
+        # mix_arrays = np.concatenate((arrays[:-1], arrays[1:]), 1)
+        # torsions = np.load(os.path.join(torsions_path, filename))
+        return arrays, filename, sequence
+
+full_dataset = DistanceWindow(distance_window_path=args.path_file, k=args.input_dim/10)
+train_size = int(0.95 * len(full_dataset))
+test_size = len(full_dataset) - train_size
+train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size])
+data_loader = DataLoader(dataset=train_dataset, shuffle=True, batch_size=args.batch_size)
+val_loader = DataLoader(dataset=test_dataset, pin_memory=True)
+
+if torch.cuda.is_available():
+    print('GPU available!!!')
+    print('MainDevice=', device)
+
+def swish_fn(x):
+    """ Swish activation function """
+    return x * torch.sigmoid(x)
+
+
+class Semilabel(nn.Module):
+    def __init__(self, input_dim=args.input_dim, hidden_dim=384, feature_dim=384, output_dim=20):
+        super().__init__()
+
+        self.input = nn.Linear(input_dim, hidden_dim//2)
+        self.ln1 = nn.LayerNorm(hidden_dim//2)
+
+        self.hidden1 = nn.Linear(hidden_dim // 2, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+
+        self.lstm = nn.LSTM(feature_dim, hidden_dim, bidirectional=True)
+        self.ln_forward = nn.LayerNorm(hidden_dim)
+        self.ln_backward = nn.LayerNorm(hidden_dim)
+
+        self.hidden_forward = nn.Linear(hidden_dim, len(dic))
+        self.hidden_backward = nn.Linear(hidden_dim, len(dic))
+
+        # self.predict = nn.Linear(hidden_dim, len(dic))
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, arrays):
+        hidden_states = swish_fn(self.ln1(self.input(arrays)))
+        hidden_states = swish_fn(self.ln2(self.hidden1(hidden_states)))
+        hidden_states = hidden_states.unsqueeze(1)
+        hidden_states, _ = self.lstm(hidden_states)
+        hidden_states = hidden_states.squeeze(1)
+        hidden_states_forward = swish_fn(self.ln_forward(hidden_states[:, :384]))
+        hidden_states_backward = swish_fn(self.ln_backward(hidden_states[:, 384:]))
+        # print(hidden_states_forward.shape, hidden_states_backward.shape)
+        # hidden_states = swish_fn(self.ln3(hidden_states))
+        # hidden_states = swish_fn(self.ln4(self.hidden(hidden_states)))
+        forward = self.dropout(self.hidden_forward(hidden_states_forward))
+        backward = self.dropout(self.hidden_backward(hidden_states_backward))
+        # output = F.softmax(output, dim=-1)
+        # output = self.dropout(output)
+
+        return forward, backward
+
+model = Semilabel().to(device)
+optimizer = torch.optim.Adamax(model.parameters(), lr=args.learning_rate)
+# scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.99, last_epoch=-1)
+
+if __name__ == '__main__':
+    for epoch in range(args.target_epochs):
+        epoch_iter = 0
+        print('epoch', epoch)
+        losses = []
+        j = 0
+        # scheduler.step()
+        for train_arrays, file_name, seq in data_loader:
+            train_arrays = torch.tensor(train_arrays, dtype=torch.float32)
+            train_arrays = train_arrays.to(device)
+            forward, backward = model(train_arrays[0])
+            forward = forward.float()
+            backward = backward.float()
+            seq = seq.squeeze().cuda()
+            total_loss = 0
+            l = len(seq)
+            total_len = 0
+            total_len += (l - range_n - 1) * 2 + (l - range_n) * 2
+            total_loss += loss_function(forward[:l - range_n], seq[range_n:]) * (l - range_n)
+            total_loss += loss_function(forward[:l - range_n - 1], seq[range_n + 1:]) * (l - range_n - 1)
+            total_loss += loss_function(backward[range_n:], seq[:l - range_n]) * (l - range_n)
+            total_loss += loss_function(backward[range_n+1:], seq[:l - range_n - 1]) * (l - range_n - 1)
+
+            total_loss /= total_len
+            losses.append(float(total_loss))
+
+
+            total_iters += args.batch_size
+            epoch_iter += args.batch_size
+            total_loss.backward()
+
+            if (j + 1) % 1 == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+            j += 1
+            # with open(save_dir + '/train_loss.txt', 'a') as writer:
+            #     writer.write(str(file_name[0]) + '\n')
+            #     writer.write(str(total_loss) + '\n')
+            if total_iters % 200 == 0:
+                loss_average = sum(losses) / len(losses)
+
+                print('iters', total_iters, '    mean_loss=', loss_average)
+                with open(save_dir + '/train_loss.txt', 'a') as writer:
+                    writer.write('iter=%s  losses_average=%s\n' % (total_iters, loss_average))
+
+            if total_iters % 1000 == 0:
+                last_linear_filename = 'last_Linear.pth'
+                last_linear_path = os.path.join(save_dir, last_linear_filename)
+                torch.save(model, last_linear_path)
+
+            if total_iters % train_size == 0:
+                save_linear_filename = '%s_Linear.pth' % epoch
+                save_linear_path = os.path.join(save_dir, save_linear_filename)
+                torch.save(model, save_linear_path)
+                model.eval()
+                model.is_training = False
+
+                with torch.no_grad():
+                    writer_val = open(save_dir + '/val_loss.txt', 'a')
+                    writer_val.write('epoch %d\n' % epoch)
+                    val_losses = []
+                    # val_output_folder = os.path.join(val_dir, '_%d' % epoch)
+                    # pathlib.Path(val_output_folder).mkdir(parents=True, exist_ok=True)
+
+                    for val_arrays, val_file_name, seq_val in val_loader:
+                        val_arrays = torch.tensor(val_arrays, dtype=torch.float32)
+                        val_arrays = val_arrays.to(device)
+
+                        forward_val, backward_val = model(val_arrays[0])
+                        forward_val = forward_val.float()
+                        backward_val = backward_val.float()
+                        seq_val = seq_val.squeeze().cuda()
+                        # seq_val = seq_val[1:] + seq_val[0]
+                        total_val_loss = 0
+                        total_val_len = 0
+                        l = len(seq_val)
+                        total_val_len += (l - range_n) * 2 + (l - (range_n + 1)) * 2
+                        total_val_loss += loss_function(forward_val[:l - range_n], seq_val[range_n:]) * (l - range_n)
+                        total_val_loss += loss_function(forward_val[:l - (range_n + 1)], seq_val[(range_n + 1):]) * (l - (range_n+1))
+                        total_val_loss += loss_function(backward_val[range_n:], seq_val[:l - range_n]) * (l - range_n)
+                        total_val_loss += loss_function(backward_val[(range_n+1):], seq_val[:l - (range_n + 1)]) * (l - (range_n + 1))
+
+                        total_val_loss /= total_val_len
+                        val_losses.append(float(total_val_loss))
+                    val_loss_av = sum(val_losses) / len(val_losses)
+                    writer_val.write('loss=%f\n' % (sum(losses) / len(losses)))
+                    writer_val.write('val_loss_avera =%f\n' % val_loss_av)
+                    writer_val.write('epoch %d, total_iters %d\n\n' % (epoch, total_iters))
+                    writer_val.close()
+                    print('val_loss_average=%f' % val_loss_av)
+                    print('epoch %d, total_iters %d' % (epoch, total_iters))
+
+                model.train()
