@@ -22,7 +22,7 @@ parser.add_argument('--path_file', type=str, default='/home/elvin/SSPS/data/nr40
 parser.add_argument('--seq_file', type=str, default='/home/elvin/SSPS/data/nr40/seq/')
 parser.add_argument('--mask_file', type=str, default='/home/elvin/SSPS/data/nr40/mask/')
 parser.add_argument('--train_file', type=str, default='pretrain_sota.py')
-parser.add_argument('--device_num', type=int, default=7)
+parser.add_argument('--device_num', type=int, default=2)
 parser.add_argument('--subset_name', type=str, default='20092001')
 parser.add_argument('--input_dim', type=int, default=150)
 parser.add_argument('--target_epochs', type=int, default=500)
@@ -33,7 +33,7 @@ args = parser.parse_args()
 device_num = args.device_num
 torch.cuda.set_device(device_num)
 device = torch.device('cuda:%d' % device_num)
-range_n = 2
+range_n = 5
 #loss
 loss_function = nn.CrossEntropyLoss()
 subset_name = args.subset_name
@@ -71,7 +71,7 @@ class DistanceWindow(Dataset):
         sequence = torch.tensor([dic[aa] for aa in list(seq)])
         arrays = np.load(os.path.join(self.distance_window_path, filename))
         arrays[:, :, 4] = arrays[:, :, 4] / 100
-        # arrays = arrays[:, :1, :]
+        # arrays = arrays[:, :25, :]
         arrays = arrays.reshape(arrays.shape[0], arrays.shape[1]*arrays.shape[2])
         filename = filename.split('.')[0]
         # mix_arrays = np.concatenate((arrays[:-1], arrays[1:]), 1)
